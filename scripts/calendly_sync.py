@@ -85,7 +85,7 @@ def get_org_uri() -> str:
     return calendly_get("/users/me")["resource"]["current_organization"]
 
 
-def get_user_uri(org_uri: str, email: str) -> str | None:
+def get_user_uri(org_uri: str, email: str):
     """Look up a rep's Calendly user URI by their email address."""
     data = calendly_get(
         "/organization_memberships",
@@ -175,7 +175,7 @@ def airtable_get_active_reps() -> list[dict]:
     records, offset = [], None
 
     while True:
-        params: dict = {"filterByFormula": f"{{{F_ACTIVE}}}=1"}
+        params: dict = {"filterByFormula": f"{{{F_ACTIVE}}}=1", "returnFieldsByFieldId": "true"}
         if offset:
             params["offset"] = offset
         resp = requests.get(url, headers=headers, params=params, timeout=20)
