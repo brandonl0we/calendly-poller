@@ -1,0 +1,38 @@
+name: Weekly Booked-This-Week Reset
+
+on:
+  # Every Monday at 6:00 AM CT
+  # 6 AM CDT (UTC-5) = 11:00 UTC  (Apr–Oct)
+  # 6 AM CST (UTC-6) = 12:00 UTC  (Nov–Mar)
+  # Using 11:00 UTC — works correctly during daylight saving time.
+  # Update to 12:00 in November if you want exact 6 AM CST.
+  schedule:
+    - cron: "0 11 * * 1"
+
+  # Manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  reset:
+    name: Reset Booked This Week
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run weekly reset
+        env:
+          AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
+        run: python scripts/weekly_reset.py
