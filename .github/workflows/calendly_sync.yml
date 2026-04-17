@@ -36,4 +36,5 @@ jobs:
         env:
           CALENDLY_API_TOKEN: ${{ secrets.CALENDLY_API_TOKEN }}
           AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
+          AC_API_KEY:         ${{ secrets.AC_API_KEY }}
         run: python scripts/calendly_sync.py

@@ -11,12 +11,14 @@ Runs every 30 minutes Mon–Fri via GitHub Actions.
 Secrets required (set in repo Settings → Secrets → Actions):
   CALENDLY_API_TOKEN   — Calendly personal access token
   AIRTABLE_API_TOKEN   — Airtable personal access token
+  AC_API_KEY           — ActiveCampaign API key
 """
 
 import os
 import sys
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -25,9 +27,16 @@ import requests
 
 CALENDLY_TOKEN = os.environ["CALENDLY_API_TOKEN"]
 AIRTABLE_TOKEN = os.environ["AIRTABLE_API_TOKEN"]
+AC_API_KEY     = os.environ["AC_API_KEY"]
 
 AIRTABLE_BASE  = "app8hrGmXlXqqACc5"
 AIRTABLE_TABLE = "tblSw0so9hmBrwgJX"
+
+AC_API_BASE = "https://ac.api-us1.com"
+
+# Maximum pipeline ARR that maps to 0 capacity — update once confirmed with team
+# e.g. a rep with $500k+ open ARR is considered fully saturated from a pipe perspective
+PIPELINE_ARR_CEILING = 500_000
 
 # Partial lowercase strings to match inbound event type names
 INBOUND_EVENT_NAMES = [
@@ -49,9 +58,13 @@ F_SLOT_WEIGHT = "fld4f57bMUXRMx2tn"
 F_LOAD_WEIGHT = "fldVGOfaXeClqWBPG"
 F_PIPE_WEIGHT = "fldNWaxZEqeGv73Zd"
 F_ACTIVE      = "fldonN4GCMmXVdmeE"
-F_AVAIL_SLOTS = "fldXBZkyIVblI0oa5"
+F_REP_TYPE      = "fldM8blAk6JTqKQZX"  # Rep type: AE or GSA
+F_CALENDLY_USER = "fld0ttny434uT3SsJ"  # Calendly username slug
+F_CALENDLY_LINK = "fldtYIqmcEHQc0sJb"  # Calendly booking URL
+F_AVAIL_SLOTS   = "fldXBZkyIVblI0oa5"
 F_BOOKED_WK   = "fldD1PzdV2Q5ZPy4L"
-F_OPEN_PIPE   = "flde5glHWiirnyRai"
+F_OPEN_PIPE   = "flde5glHWiirnyRai"   # open deal count (volume) — written from AC CRM
+F_OPEN_ARR    = "fld29vI3CATJLm40R"      # total open pipeline ARR — written from AC CRM
 F_SCORE       = "fldqho14Dqv38iZi6"
 F_STATUS      = "fldU20rnhGZZn6FeH"
 F_SYNCED_AT   = "fldpDhu2Im2MYsIMU"
@@ -85,8 +98,11 @@ def get_org_uri() -> str:
     return calendly_get("/users/me")["resource"]["current_organization"]
 
 
-def get_user_uri(org_uri: str, email: str):
-    """Look up a rep's Calendly user URI by their email address."""
+def get_user_info(org_uri: str, email: str) -> Optional[dict]:
+    """
+    Look up a rep's Calendly info by email.
+    Returns dict with uri, slug, and scheduling_url, or None if not found.
+    """
     data = calendly_get(
         "/organization_memberships",
         {"organization": org_uri, "email": email},
@@ -94,7 +110,12 @@ def get_user_uri(org_uri: str, email: str):
     members = data.get("collection", [])
     if not members:
         return None
-    return members[0]["user"]["uri"]
+    user = members[0]["user"]
+    return {
+        "uri":             user.get("uri", ""),
+        "slug":            user.get("slug", ""),
+        "scheduling_url":  user.get("scheduling_url", ""),
+    }
 
 
 def get_inbound_event_type_uris(user_uri: str) -> list[str]:
@@ -200,6 +221,73 @@ def airtable_update_record(record_id: str, fields: dict) -> None:
     resp.raise_for_status()
 
 
+# ── ActiveCampaign CRM helpers ────────────────────────────────────────────────
+
+def ac_get(path: str, params: dict = None) -> dict:
+    """GET an ActiveCampaign v3 endpoint, raise on non-2xx."""
+    resp = requests.get(
+        f"{AC_API_BASE}/api/3{path}",
+        headers={"Api-Token": AC_API_KEY},
+        params=params or {},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_ac_user_map() -> dict[str, str]:
+    """
+    Return a {email: user_id} map for all AC CRM users.
+    Fetched once per run and used to resolve rep emails to AC user IDs.
+    Paginates to handle accounts with more than 100 users.
+    """
+    users: list[dict] = []
+    offset = 0
+    limit  = 100
+
+    while True:
+        data  = ac_get("/users", {"limit": limit, "offset": offset})
+        batch = data.get("users", [])
+        users.extend(batch)
+        total = int(data.get("meta", {}).get("total", 0))
+        offset += len(batch)
+        if not batch or offset >= total:
+            break
+
+    return {u["email"]: u["id"] for u in users}
+
+
+def get_rep_pipeline(ac_user_id: str) -> tuple[int, float]:
+    """
+    Return (deal_count, total_arr) for all open deals owned by the given AC user.
+
+    "Open" means status == 0 (not won or lost).
+    Deal values in AC are stored as cents (integer) — divided by 100 for dollars.
+    Paginates automatically to handle reps with large pipelines.
+    """
+    deals: list[dict] = []
+    offset = 0
+    limit  = 100
+
+    while True:
+        data = ac_get("/deals", {
+            "filters[owner]": ac_user_id,
+            "filters[status]": 0,       # 0=open, 1=won, 2=lost
+            "limit":  limit,
+            "offset": offset,
+        })
+        batch = data.get("deals", [])
+        deals.extend(batch)
+        total = int(data.get("meta", {}).get("total", 0))
+        offset += len(batch)
+        if not batch or offset >= total:
+            break
+
+    deal_count = len(deals)
+    total_arr  = sum(int(d.get("value", 0)) for d in deals) / 100.0  # cents → dollars
+    return deal_count, total_arr
+
+
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
 def compute_capacity_score(
@@ -207,7 +295,7 @@ def compute_capacity_score(
     max_daily:   int,
     booked_wk:   int,
     max_wk:      int,
-    open_pipe:   int,
+    open_arr:    float,
     slot_w:      float,
     load_w:      float,
     pipe_w:      float,
@@ -215,14 +303,15 @@ def compute_capacity_score(
     """
     Returns (capacity_score, slot_score, load_score, pipe_score).
 
-    slot_score  — fraction of max weekly slot capacity currently open
-    load_score  — fraction of max weekly meetings not yet booked
-    pipe_score  — 100 when no CRM data; replace with real value when available
+    slot_score  — fraction of max weekly slot capacity currently open (higher = more capacity)
+    load_score  — fraction of max weekly meetings not yet booked (higher = more capacity)
+    pipe_score  — inverted ARR signal: higher open ARR = lower score (higher = more capacity)
+                  saturates at PIPELINE_ARR_CEILING (score = 0 at ceiling or above)
     """
     capacity_slots = max_daily * 5  # 5 business days
     slot_score = min(100.0, (avail_slots / capacity_slots) * 100) if capacity_slots else 0.0
     load_score = min(100.0, max(0.0, (1 - booked_wk / max_wk) * 100)) if max_wk else 0.0
-    pipe_score = 100.0  # TODO: swap for live CRM open-deal count when integrated
+    pipe_score = max(0.0, 100.0 - (open_arr / PIPELINE_ARR_CEILING) * 100) if PIPELINE_ARR_CEILING else 100.0
 
     score = round(slot_score * slot_w + load_score * load_w + pipe_score * pipe_w, 1)
     return score, slot_score, load_score, pipe_score
@@ -250,12 +339,16 @@ def main() -> None:
     reps = airtable_get_active_reps()
     log.info("Active reps: %d", len(reps))
 
+    log.info("Building AC CRM user map ...")
+    ac_user_map = build_ac_user_map()
+    log.info("AC users loaded: %d", len(ac_user_map))
+
     now_iso = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     warnings: list[str] = []
 
     for rec in reps:
-        f    = rec["fields"]
-        name = f.get(F_NAME, "Unknown")
+        f     = rec["fields"]
+        name  = f.get(F_NAME, "Unknown")
         email = f.get(F_EMAIL, "")
 
         log.info("── %s (%s)", name, email)
@@ -266,13 +359,14 @@ def main() -> None:
             warnings.append(msg)
             continue
 
-        # 1. Resolve Calendly user URI
-        user_uri = get_user_uri(org_uri, email)
-        if not user_uri:
+        # 1. Resolve Calendly user info
+        user_info = get_user_info(org_uri, email)
+        if not user_info:
             msg = f"{name}: not found in Calendly org"
             log.warning("  %s", msg)
             warnings.append(msg)
             continue
+        user_uri = user_info["uri"]
 
         # 2. Find inbound event type URIs
         et_uris = get_inbound_event_type_uris(user_uri)
@@ -286,17 +380,27 @@ def main() -> None:
         avail_slots = count_available_slots(et_uris, business_days=5)
         log.info("  Available slots (5d): %d", avail_slots)
 
-        # 4. Calculate score
-        max_daily  = int(f.get(F_MAX_DAILY, 2))
-        max_wk     = int(f.get(F_MAX_WEEKLY, 10))
-        booked_wk  = int(f.get(F_BOOKED_WK, 0))
-        open_pipe  = int(f.get(F_OPEN_PIPE, 0))
-        slot_w     = float(f.get(F_SLOT_WEIGHT, 0.40))
-        load_w     = float(f.get(F_LOAD_WEIGHT, 0.35))
-        pipe_w     = float(f.get(F_PIPE_WEIGHT, 0.25))
+        # 4. Fetch pipeline data from AC CRM
+        ac_user_id = ac_user_map.get(email)
+        if ac_user_id:
+            deal_count, open_arr = get_rep_pipeline(ac_user_id)
+            log.info("  Pipeline — deals: %d  ARR: $%.0f", deal_count, open_arr)
+        else:
+            deal_count, open_arr = 0, 0.0
+            msg = f"{name}: not found in AC CRM — pipeline score defaulting to 100"
+            log.warning("  %s", msg)
+            warnings.append(msg)
+
+        # 5. Calculate score
+        max_daily = int(f.get(F_MAX_DAILY, 2))
+        max_wk    = int(f.get(F_MAX_WEEKLY, 10))
+        booked_wk = int(f.get(F_BOOKED_WK, 0))
+        slot_w    = float(f.get(F_SLOT_WEIGHT, 0.40))
+        load_w    = float(f.get(F_LOAD_WEIGHT, 0.35))
+        pipe_w    = float(f.get(F_PIPE_WEIGHT, 0.25))
 
         score, slot_s, load_s, pipe_s = compute_capacity_score(
-            avail_slots, max_daily, booked_wk, max_wk, open_pipe,
+            avail_slots, max_daily, booked_wk, max_wk, open_arr,
             slot_w, load_w, pipe_w,
         )
         status = routing_status(score)
@@ -305,13 +409,20 @@ def main() -> None:
             slot_s, load_s, pipe_s, score, status,
         )
 
-        # 5. Write back to Airtable
-        airtable_update_record(rec["id"], {
+        # 6. Write back to Airtable
+        fields = {
             F_AVAIL_SLOTS: avail_slots,
+            F_OPEN_PIPE:   deal_count,
+            F_OPEN_ARR:    round(open_arr, 2),
             F_SCORE:       score,
             F_STATUS:      status,
             F_SYNCED_AT:   now_iso,
-        })
+        }
+        if user_info["slug"]:
+            fields[F_CALENDLY_USER] = user_info["slug"]
+        if user_info["scheduling_url"]:
+            fields[F_CALENDLY_LINK] = user_info["scheduling_url"]
+        airtable_update_record(rec["id"], fields)
         log.info("  ✓ Airtable updated")
 
     # Summary
