@@ -34,9 +34,13 @@ AIRTABLE_TABLE = "tblSw0so9hmBrwgJX"
 
 AC_API_BASE = "https://ac.api-us1.com"
 
-# Maximum pipeline ARR that maps to 0 capacity — update once confirmed with team
-# e.g. a rep with $500k+ open ARR is considered fully saturated from a pipe perspective
-PIPELINE_ARR_CEILING = 500_000
+# Maximum open pipeline ARR at which pipe_score → 0 (rep fully saturated).
+# Derived from top-25% L90 closed ARR × 1.5 per role via calibrate_capacity.py.
+# AEs carry much larger deals; GSAs run higher volume at lower ACV.
+PIPELINE_ARR_CEILING = {
+    "AE":  1_200_000,   # ~top-25% AE closes $600-750k/qtr × 1.5
+    "GSA":   400_000,   # ~top-25% GSA closes $175-420k/qtr × 1.5
+}
 
 # Partial lowercase strings to match inbound event type names
 INBOUND_EVENT_NAMES = [
@@ -299,6 +303,7 @@ def compute_capacity_score(
     slot_w:      float,
     load_w:      float,
     pipe_w:      float,
+    rep_type:    str = "AE",
 ) -> tuple[float, float, float, float]:
     """
     Returns (capacity_score, slot_score, load_score, pipe_score).
@@ -306,12 +311,13 @@ def compute_capacity_score(
     slot_score  — fraction of max weekly slot capacity currently open (higher = more capacity)
     load_score  — fraction of max weekly meetings not yet booked (higher = more capacity)
     pipe_score  — inverted ARR signal: higher open ARR = lower score (higher = more capacity)
-                  saturates at PIPELINE_ARR_CEILING (score = 0 at ceiling or above)
+                  saturates at PIPELINE_ARR_CEILING[rep_type] (score = 0 at ceiling or above)
     """
+    ceiling = PIPELINE_ARR_CEILING.get(rep_type, PIPELINE_ARR_CEILING.get("AE", 1_200_000))
     capacity_slots = max_daily * 5  # 5 business days
     slot_score = min(100.0, (avail_slots / capacity_slots) * 100) if capacity_slots else 0.0
     load_score = min(100.0, max(0.0, (1 - booked_wk / max_wk) * 100)) if max_wk else 0.0
-    pipe_score = max(0.0, 100.0 - (open_arr / PIPELINE_ARR_CEILING) * 100) if PIPELINE_ARR_CEILING else 100.0
+    pipe_score = max(0.0, 100.0 - (open_arr / ceiling) * 100) if ceiling else 100.0
 
     score = round(slot_score * slot_w + load_score * load_w + pipe_score * pipe_w, 1)
     return score, slot_score, load_score, pipe_score
@@ -398,10 +404,11 @@ def main() -> None:
         slot_w    = float(f.get(F_SLOT_WEIGHT, 0.40))
         load_w    = float(f.get(F_LOAD_WEIGHT, 0.35))
         pipe_w    = float(f.get(F_PIPE_WEIGHT, 0.25))
+        rep_type  = f.get(F_REP_TYPE, "AE")
 
         score, slot_s, load_s, pipe_s = compute_capacity_score(
             avail_slots, max_daily, booked_wk, max_wk, open_arr,
-            slot_w, load_w, pipe_w,
+            slot_w, load_w, pipe_w, rep_type,
         )
         status = routing_status(score)
         log.info(
