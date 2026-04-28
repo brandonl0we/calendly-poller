@@ -1,10 +1,5 @@
 name: Calendly Capacity Sync
 
-on:
-  # Every 30 minutes, Mon–Fri, 7 AM–7 PM CT
-  # CT = CDT (UTC-5) during daylight saving, CST (UTC-6) in winter.
-  # These cron windows cover 12:00–00:00 UTC = 7 AM–7 PM CDT (summer).
-  # Adjust the hours by +1 (to 13:00–01:00) Nov–Mar for CST.
   schedule:
     - cron: "0,30 12-23 * * 1-5"   # Mon–Fri  12:00–23:30 UTC (7 AM–6:30 PM CDT)
     - cron: "0    0    * * 2-6"    # Tue–Sat  00:00 UTC     (7 PM CDT previous day)
